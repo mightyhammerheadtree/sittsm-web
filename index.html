@@ -3,7 +3,7 @@
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no">
-	<title>SITTSM (itch.io) - ported by mht</title>
+	<title>SITTSM (itch.io) - ported by mht </title>
 	<style>
 		html, body { margin: 0; padding: 0; background: #000; width: 100%; height: 100%; overflow: hidden; }
 		#unity-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
@@ -221,6 +221,162 @@
 				matchWebGLToCanvasSize: false,
 				showBanner: function (msg, type) { status.textContent = msg; if (type === "error" && status.textContent.length > 200) status.textContent = status.textContent.slice(0, 200); }
 			};
+			// WebPort #21b: chunked data download. WebGL.data.gz (~150 MB) exceeds
+			// GitHub's 100 MB push limit, so it ships as 7 numbered parts
+			// (WebGL.data.gz.p1..p7 + WebGL.data.manifest.json, sha256-checked).
+			// createUnityInstance's official config.XMLHttpRequest hook is used:
+			// the data URL is fetched part-by-part in parallel (retries included),
+			// reassembled, gunzipped in memory (DecompressionStream) and handed to
+			// the loader as one ArrayBuffer. Every other URL passes through a real
+			// XMLHttpRequest untouched.
+			conf.XMLHttpRequest = (function (dataUrl) {
+				var DIR = dataUrl.slice(0, dataUrl.lastIndexOf("/") + 1);
+				var MANIFEST = DIR + "WebGL.data.manifest.json";
+				function ChunkedXHR(opts) {
+					this._opts = opts || {};
+					this._listeners = {};
+					this._props = { readyState: 0 };
+					this._real = null;
+					this._chunked = false;
+				}
+				ChunkedXHR.prototype.addEventListener = function (type, fn) {
+					if (this._real) return this._real.addEventListener(type, fn);
+					(this._listeners[type] = this._listeners[type] || []).push(fn);
+				};
+				ChunkedXHR.prototype.open = function (method, url) {
+					this._chunked = (url === dataUrl);
+					if (!this._chunked) this._real = new XMLHttpRequest();
+				};
+				ChunkedXHR.prototype.setRequestHeader = function (k, v) { if (this._real) this._real.setRequestHeader(k, v); };
+				ChunkedXHR.prototype.getAllResponseHeaders = function () { return this._real ? this._real.getAllResponseHeaders() : ""; };
+				ChunkedXHR.prototype.getResponseHeader = function (h) { return this._real ? this._real.getResponseHeader(h) : null; };
+				ChunkedXHR.prototype.abort = function () { if (this._real) this._real.abort(); };
+				ChunkedXHR.prototype._emit = function (type, ev) {
+					var ls = this._listeners[type] || [];
+					for (var i = 0; i < ls.length; i++) { try { ls[i].call(this, ev); } catch (e) {} }
+					var h = this["on" + type];
+					if (h) { try { h.call(this, ev); } catch (e) {} }
+				};
+				ChunkedXHR.prototype.send = function () {
+					if (this._real) return this._real.send.apply(this._real, arguments);
+					var self = this;
+					self._props.readyState = 1;
+					function fail(msg) {
+						self._props.readyState = 4; self._props.status = 0;
+						try { console.error("[WebPort] data chunks: " + msg); } catch (e) {}
+						try { var st = document.getElementById("status"); if (st) st.textContent = ("data chunks failed: " + msg).slice(0, 200); } catch (e) {}
+						self._emit("error", { type: "error", message: msg });
+					}
+					fetch(MANIFEST, { cache: "no-store" }).then(function (r) {
+						if (!r.ok) throw new Error("manifest HTTP " + r.status);
+						return r.json();
+					}).then(function (m) {
+						if (!m || !m.files || !m.files.length) throw new Error("bad data manifest");
+						var total = m.size | 0;
+						var bufs = new Array(m.files.length);
+						var got = new Array(m.files.length);
+						var lastReport = 0;
+						function report(final_) {
+							var now = Date.now();
+							if (!final_ && now - lastReport < 100) return;
+							lastReport = now;
+							var loaded = 0;
+							for (var i = 0; i < got.length; i++) loaded += got[i] || 0;
+							self._emit("progress", { type: "progress", lengthComputable: true, loaded: loaded, total: total });
+							try {
+								var st = document.getElementById("status");
+								if (st) st.textContent = "loading data " + Math.floor((100 * loaded) / Math.max(1, total)) + "%";
+							} catch (e) {}
+						}
+						return Promise.all(m.files.map(function (name, i) {
+							var attempts = 0;
+							function attempt() {
+								attempts++;
+								return fetch(DIR + name, { cache: "no-store" }).then(function (r) {
+									if (!r.ok) throw new Error(name + " HTTP " + r.status);
+									var expected = m.sizes[i] | 0;
+									var chunks = [], size = 0;
+									var reader = r.body.getReader();
+									function pump() {
+										return reader.read().then(function (res) {
+											if (res.done) {
+												var all = new Uint8Array(size), off = 0;
+												for (var c = 0; c < chunks.length; c++) { all.set(chunks[c], off); off += chunks[c].length; }
+												if (all.length !== expected) throw new Error(name + " size " + all.length + " != " + expected);
+												function accept() { bufs[i] = all; got[i] = all.length; report(true); }
+												if (m.sha256 && m.sha256[i] && window.crypto && crypto.subtle) {
+													return crypto.subtle.digest("SHA-256", all).then(function (h) {
+														var hex = Array.prototype.map.call(new Uint8Array(h), function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+														if (hex !== m.sha256[i]) throw new Error(name + " corrupt (sha256 mismatch)");
+														accept();
+													});
+												}
+												accept();
+												return;
+											}
+											chunks.push(res.value);
+											size += res.value.length;
+											got[i] = size;
+											report(false);
+											return pump();
+										});
+									}
+									return pump();
+								}).catch(function (err) {
+									if (attempts < 3) return new Promise(function (res) { setTimeout(res, 400 * attempts); }).then(attempt);
+									throw err;
+								});
+							}
+							return attempt();
+						})).then(function () {
+							var index = 0;
+							var partStream = new ReadableStream({
+								pull: function (ctrl) {
+									if (index < bufs.length) ctrl.enqueue(bufs[index++]);
+									else ctrl.close();
+								}
+							});
+							var bytes;
+							if (m.gzip === false) bytes = new Response(partStream).arrayBuffer();
+							else {
+								if (typeof DecompressionStream === "undefined")
+									throw new Error("browser lacks DecompressionStream (Chrome/Edge 103+, Firefox 113+, Safari 16.4+)");
+								bytes = new Response(partStream.pipeThrough(new DecompressionStream("gzip"))).arrayBuffer();
+							}
+							return bytes.then(function (decompressed) {
+								bufs.length = 0; got.length = 0;
+								var check = Promise.resolve();
+								if (m.sha256Decompressed && window.crypto && crypto.subtle) {
+									check = crypto.subtle.digest("SHA-256", decompressed).then(function (h) {
+										var hex = Array.prototype.map.call(new Uint8Array(h), function (b) { return ("0" + b.toString(16)).slice(-2); }).join("");
+										if (hex !== m.sha256Decompressed) throw new Error("reassembled data corrupt (sha256 mismatch)");
+									});
+								}
+								return check.then(function () {
+									self._props.readyState = 4; self._props.status = 200; self._props.statusText = "OK";
+									self._props.response = decompressed;
+									self._props.responseURL = self._url;
+									self._emit("load", { type: "load", lengthComputable: true, loaded: total, total: total });
+								});
+							});
+						});
+					}).catch(function (err) { fail(String((err && err.message) || err)); });
+				};
+				["status", "statusText", "response", "responseText", "responseURL"].forEach(function (p) {
+					Object.defineProperty(ChunkedXHR.prototype, p, {
+						set: function (v) { if (this._real) this._real[p] = v; else this._props[p] = v; },
+						get: function () { return this._real ? this._real[p] : this._props[p]; }
+					});
+				});
+				Object.defineProperty(ChunkedXHR.prototype, "responseType", {
+					set: function (v) { if (this._real) this._real.responseType = v; else this._props.responseType = v; },
+					get: function () { return this._real ? this._real.responseType : this._props.responseType; }
+				});
+				Object.defineProperty(ChunkedXHR.prototype, "readyState", {
+					get: function () { return this._real ? this._real.readyState : this._props.readyState; }
+				});
+				return function (opts) { return new ChunkedXHR(opts); };
+			})(conf.dataUrl);
 			canvas.width = 1280; canvas.height = 720;
 			// keep canvas crisp but cheap: fixed 1280x720 backing store, CSS-scaled
 			createUnityInstance(canvas, conf, null, function (p) {
