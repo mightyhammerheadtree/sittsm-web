@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html><body><h1>worker beacon test</h1><script>
+function beacon(text) {
+  try { navigator.sendBeacon("/beacon", new Blob([text], { type: "text/plain" })); } catch (e) {}
+}
+beacon("MAIN started in worker-test");
+try {
+  var code = 'var n=0;' +
+    'function wb(t){ try { navigator.sendBeacon("/beacon", new Blob([t], {type:"text/plain"})); } catch(e){ try { fetch("/beacon", {method:"POST", body:t, keepalive:true}); } catch(e2){} } }' +
+    'wb("WORKER-test begin");' +
+    'setInterval(function(){ wb("WORKER hb n="+n+" t="+Date.now()); n++; }, 500);';
+  var wurl = URL.createObjectURL(new Blob([code], { type: "application/javascript" }));
+  var w = new Worker(wurl);
+  w.onerror = function(e) { beacon("WORKER-TEST onerror: " + (e.message || JSON.stringify(e))); };
+  beacon("MAIN spawned worker (sendBeacon only)");
+} catch (e) {
+  beacon("MAIN worker failed: " + (e && e.message ? e.message : e));
+}
+try {
+  var code2 = 'var m=0;' +
+    'function wb2(t){ try { fetch("/beacon", {method:"POST", body:t, keepalive:true}); } catch(e){} }' +
+    'wb2("WORKER2 begin (fetch only)");' +
+    'setInterval(function(){ wb2("WORKER2 hb n="+m+" t="+Date.now()); m++; }, 500);';
+  var w2 = new Worker(URL.createObjectURL(new Blob([code2], { type: "application/javascript" })));
+} catch (e) {
+  beacon("MAIN worker2 failed: " + (e && e.message ? e.message : e));
+}
+setInterval(function(){ beacon("MAIN hb t=" + Date.now()); }, 1000);
+</script></body></html>

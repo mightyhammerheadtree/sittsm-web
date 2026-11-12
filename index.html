@@ -1,0 +1,240 @@
+﻿<!DOCTYPE html>
+<html lang="en">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no">
+	<title>SITTSM (itch.io) - ported by mht</title>
+	<style>
+		html, body { margin: 0; padding: 0; background: #000; width: 100%; height: 100%; overflow: hidden; }
+		#unity-canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; }
+		#load { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+			font: 14px monospace; color: #aaa; }
+		#bar { width: 420px; max-width: 60vw; height: 8px; background: #222; margin-top: 14px; overflow: hidden; }
+		#fill { width: 0%; height: 100%; background: #888; }
+		#pct { margin-top: 8px; }
+		#status { margin-top: 6px; opacity: .8; }
+	</style>
+</head>
+<body>
+	<canvas id="unity-canvas" width="1280" height="720" tabindex="-1"></canvas>
+	<div id="load">
+		<div id="bar"><div id="fill"></div></div>
+		<div id="pct">0%</div>
+		<div id="status">loading</div>
+	</div>
+	<script>
+		// WebPort console-recorder: mirror every console line + wasm/js memory telemetry
+		// to the local server via sendBeacon so a tab-crash can NEVER erase the log
+		// (Chrome clears DevTools when the renderer dies). Pure instrumentation path.
+		(function() {
+			// Patch identity: bump on every patch batch so the beacon log always shows
+			// which build the session ran (user request: "so i actually know when
+			// builds change").
+			var BUILD_TAG = "21";
+			function beacon(text) {
+				try { navigator.sendBeacon("/beacon", new Blob([text], { type: "text/plain" })); } catch (e) {}
+			}
+			beacon("BUILD " + BUILD_TAG + " page=" + location.pathname);
+			beacon("BOOT session=" + Date.now());
+			// Main-thread heartbeat at 1 Hz: when these stop while WORKER hb continue,
+			// the Unity main thread is provably frozen (not the server, not the tab).
+			setInterval(function () {
+				beacon("MAIN hb page=" + (location.pathname.split("/").pop() || "index") + " t=" + Date.now());
+			}, 1000);
+			// Worker heartbeat: runs on a separate thread, so it beacons continuously
+			// EVEN WHILE the Unity main thread is frozen, giving exact stall start/end
+			// times (main-thread MEM lines go silent around it; gaps = freeze duration).
+			// Workers need ABSOLUTE URLs for fetch (WorkerGlobalScope has no document base;
+			// build #11 lesson: fetch('/beacon') threw "Failed to parse URL"), so we inject
+			// the page's own origin into the worker code.
+			try {
+				var BEACON = (location.origin && location.origin.indexOf("http") === 0
+					? location.origin : "http://127.0.0.1:8100") + "/beacon";
+				var workerCode = "var n=0; var B='" + BEACON + "';" +
+					"function wb(t){ try { fetch(B, {method:'POST', body:t, keepalive:true}); } catch(e){ try { fetch(B, {method:'POST', body:t}); } catch(e2){} } }" +
+					"wb('WORKER-test begin build=" + BUILD_TAG + "');" +
+					"setInterval(function(){ wb('WORKER hb n=' + n + ' t=' + Date.now()); n++; }, 500);";
+				var wurl = URL.createObjectURL(new Blob([workerCode], { type: "application/javascript" }));
+				var w = new Worker(wurl);
+				w.onerror = function (e) {
+					beacon("WORKER onerror: " + (e.message || "?") + " line=" + (e.lineno || "?"));
+				};
+				beacon("WORKER started build=" + BUILD_TAG);
+			} catch (e) {
+				beacon("WORKER failed: " + e);
+			}
+			// Build #14 console-gap trap: when a console line lands >5 s after the
+			// previous tapped line, beacon the silence length FIRST so the chronicle
+			// shows exactly how long the main thread was wedged before the next
+			// line (if any) arrived. (Unity Debug.Log routes through console.log.)
+			//
+			// WebPort #17 beacon flood control. Build 16 POSTed one beacon per
+			// console line with zero dedup: the SetHoldUprightForce NRE storm
+			// alone fired ~9,600 posts, plus ~400 identical physics warnings and
+			// 48 repeats of the same six shader errors -- measurable main-thread
+			// CPU inside the fragile activation window. Layers (DevTools still
+			// sees EVERY line; only the beacon path is filtered):
+			//   1. identical-consecutive dedup -> one "DUP xN last: ..." summary
+			//   2. noisy families (digit-normalized head) stop after 30 repeats
+			//   3. token-bucket rate limit ~40 posts/s, notice line every 5 s
+			var __lastLogT = 0;
+			var __dupNorm = null, __dupRaw = "", __dupN = 0, __dupLevel = "";
+			var __fam = {};
+			var __rlWinStart = 0, __rlSent = 0, __rlDropped = 0, __rlNoticeT = 0;
+			function __rlAllow() {
+				var now = Date.now();
+				if (now - __rlWinStart >= 1000) { __rlWinStart = now; __rlSent = 0; }
+				if (__rlSent < 40) { __rlSent++; return true; }
+				__rlDropped++;
+				if (now - __rlNoticeT >= 5000) {
+					__rlNoticeT = now;
+					try { navigator.sendBeacon("/beacon", new Blob(["RATELIMIT dropped=" + __rlDropped + " posts since last notice"], { type: "text/plain" })); } catch (e) {}
+					__rlDropped = 0;
+				}
+				return false;
+			}
+			function __flushDup() {
+				if (__dupN > 1 && __rlAllow())
+					beacon(__dupLevel.toUpperCase() + " DUP x" + __dupN + " last: " + String(__dupRaw).slice(0, 160).replace(/[0-9]+/g, "#"));
+				__dupN = 0; __dupNorm = null; __dupRaw = ""; __dupLevel = "";
+			}
+			["log", "warn", "error"].forEach(function (level) {
+				var orig = console[level];
+				console[level] = function () {
+					var s = Array.prototype.map.call(arguments, function (a) {
+						try { return typeof a === "string" ? a : (a && a.message) ? a.message : String(a); } catch (e) { return "?"; }
+					}).join(" ");
+					var now = Date.now();
+					if (__lastLogT && now - __lastLogT >= 5000)
+						beacon("LOG-GAP " + (now - __lastLogT) + "ms silence before next line");
+					__lastLogT = now;
+					try {
+						if (!/FSB failed|Decode error|syncfs|getInternalformat|INVALID_ENUM/i.test(s.slice(0, 90))) {
+							// WebPort #18: our own [WebPort] instrumentation lines
+							// are low-volume but critical (progressive-activation
+							// progress, gate logs, engine pulses). In build 17 the
+							// rate limiter dropped them during NRE floods, so
+							// exempt them from dedup/family/rate-limit entirely.
+							if (s.indexOf("[WebPort]") >= 0) {
+								beacon(level.toUpperCase() + " " + s.slice(0, 4000));
+							} else {
+								var norm = s.slice(0, 300).replace(/[0-9]+\.[0-9]+/g, "#").replace(/[0-9]+/g, "#");
+								if (norm === __dupNorm && level === __dupLevel) {
+									__dupN++;
+									__dupRaw = s;
+								} else {
+									__flushDup();
+									var fk = level.charAt(0) + norm.slice(0, 64);
+									var hits = (__fam[fk] || 0) + 1;
+									__fam[fk] = hits;
+									if (hits <= 30 && __rlAllow())
+										beacon(level.toUpperCase() + " " + s.slice(0, 4000));
+									__dupNorm = norm; __dupRaw = s; __dupN = 1; __dupLevel = level;
+								}
+							}
+						}
+					} catch (e) {}
+					if (orig) try { orig.apply(console, arguments); } catch (e) {}
+				};
+			});
+			window.addEventListener("error", function (e) {
+				beacon("WINDOWERROR " + (e.message || "?") + " @ " + (e.filename || "?") + ":" + (e.lineno || 0));
+			});
+			window.addEventListener("unhandledrejection", function (e) {
+				var r = e.reason;
+				try {
+					var m = String((r && (r.message || r.name)) || r);
+					// skip FMOD noise (the later listener cancels its default; don't beacon spam)
+					if (!/Unable to decode audio data|EncodingError|FSB/i.test(m))
+						beacon("UNHANDLED-REJ " + m.substr(0, 200));
+				} catch (err) {}
+			});
+			window.addEventListener("pagehide", function () { beacon("TAB pagehide"); });
+			// rAF heartbeat (build #12): counts requestAnimationFrame callbacks.
+			// CANNOT die from an engine abort (separate rAF chain) -- its value is
+			// the opposite: prove the page is NOT throttled/frozen at browser
+			// level while the C# engine pulse (WebPortFramePulse) dead-reckons
+			// the Unity frame loop. Engine dead + RAF alive = silent abort.
+			var __rafTicks = 0, __rafLast = 0;
+			function __rafWatch() {
+				__rafTicks++;
+				var now = performance.now();
+				if (now - __rafLast >= 1000) {
+					beacon("RAF hb ticks=" + __rafTicks);
+					__rafTicks = 0;
+					__rafLast = now;
+				}
+				requestAnimationFrame(__rafWatch);
+			}
+			requestAnimationFrame(__rafWatch);
+			var __lastW = -1, __lastJ = -1, __tick = 0;
+			function sample() {
+				__tick++;
+				try {
+					var u = window.__unityInstance, h = u && u.Module && u.Module.HEAPU32;
+					var w = h ? h.byteLength : -1;
+					var pm = performance.memory;
+					var j = pm ? pm.usedJSHeapSize : -1;
+					var dw = (w > 0 && __lastW > 0) ? w - __lastW : 0;
+					var dj = (j > 0 && __lastJ > 0) ? j - __lastJ : 0;
+					if ((Math.abs(dw) > 1048576 || Math.abs(dj) > 1048576) || (__tick % 8) === 0) {
+						beacon("MEM js=" + j + " wasm=" + w + (dw ? " wasm-d=" + dw : "") + (dj ? " js-d=" + dj : ""));
+					}
+					__lastW = w; __lastJ = j;
+				} catch (e) {}
+			}
+			setInterval(sample, 250);
+			var cv = document.getElementById("unity-canvas");
+			cv.addEventListener("webglcontextlost", function (e) {
+				beacon("CONTEXTLOST reason=" + (e.statusMessage || "?"));
+			}, true);
+			window.addEventListener("beforeunload", function () { beacon("UNLOAD page"); });
+		})();
+	</script>
+	<script src="Build/WebGL.loader.js"></script>
+	<script>
+		(function () {
+			// WebPort: FMOD banks are not browser-decodable (FSB decode fails) and FMOD's
+			// promise rejections flood the console as uncaught EncodingError pairs. Filter
+			// only those; real errors still surface.
+			window.addEventListener("unhandledrejection", function (e) {
+				var r = e.reason;
+				var m = String((r && (r.message || r.name)) || r);
+				if (/Unable to decode audio data|EncodingError|FSB/i.test(m)) e.preventDefault();
+			});
+			var canvas = document.getElementById("unity-canvas");
+			var fill = document.getElementById("fill"), pct = document.getElementById("pct"), status = document.getElementById("status");
+			// WebPort build #13: REAL fixed backing store (the old comment claimed
+			// 1280x720 but no code did it). Without a cap Unity sizes the framebuffer
+			// from canvas CSS box * devicePixelRatio -- on HiDPI/big monitors the
+			// engine burns multiples of the needed GPU fill for a game that visibly
+			// reads fine scaled up. matchWebGLToCanvasSize:false makes Unity keep
+			// whatever backing store we assign (official Unity WebGL option).
+			var conf = {
+				dataUrl: "Build/WebGL.data.gz",
+				frameworkUrl: "Build/WebGL.framework.js.gz",
+				codeUrl: "Build/WebGL.wasm.gz",
+				streamingAssetsUrl: "StreamingAssets",
+				companyName: "Fishagon",
+				productName: "Stick It To The Stickman",
+				productVersion: "1.0",
+				matchWebGLToCanvasSize: false,
+				showBanner: function (msg, type) { status.textContent = msg; if (type === "error" && status.textContent.length > 200) status.textContent = status.textContent.slice(0, 200); }
+			};
+			canvas.width = 1280; canvas.height = 720;
+			// keep canvas crisp but cheap: fixed 1280x720 backing store, CSS-scaled
+			createUnityInstance(canvas, conf, null, function (p) {
+				pct.textContent = Math.round(p * 100) + "%";
+				fill.style.width = Math.round(p * 100) + "%";
+				if (p >= 1) status.textContent = "starting...";
+			}).then(function (i) {
+				var l = document.getElementById("load");
+				l.style.transition = "opacity .3s"; l.style.opacity = "0";
+				setTimeout(function () { l.remove(); }, 350);
+				window.__unityInstance = i;
+				canvas.focus();
+			}).catch(function (e) { status.textContent = "load error: " + e; });
+		})();
+	</script>
+</body>
+</html>
