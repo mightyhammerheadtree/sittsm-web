@@ -13,6 +13,8 @@
 		#fill { width: 0%; height: 100%; background: #888; }
 		#pct { margin-top: 8px; }
 		#status { margin-top: 6px; opacity: .8; }
+		#buildtag { position: fixed; right: 10px; bottom: 8px; font: 11px monospace;
+			color: #556; z-index: 5; pointer-events: none; }
 	</style>
 </head>
 <body>
@@ -22,6 +24,7 @@
 		<div id="pct">0%</div>
 		<div id="status">loading</div>
 	</div>
+	<div id="buildtag"></div>
 	<script>
 		// WebPort console-recorder: mirror every console line + wasm/js memory telemetry
 		// to the local server via sendBeacon so a tab-crash can NEVER erase the log
@@ -30,7 +33,11 @@
 			// Patch identity: bump on every patch batch so the beacon log always shows
 			// which build the session ran (user request: "so i actually know when
 			// builds change").
-			var BUILD_TAG = "22";
+			var BUILD_TAG = "23";
+			// visible build label (restored #23: lost during the #22 page surgery) --
+			// bottom-right, so "which build is actually loaded" is checkable without
+			// the console (stale-cache confusion guard).
+			try { var __bt = document.getElementById("buildtag"); if (__bt) __bt.textContent = "WebPort build " + BUILD_TAG; } catch (e) {}
 			// WebPort #21c: telemetry is DEV-ONLY. GitHub Pages and the fpile host
 			// cannot accept POSTs (405 spam drowned the console), so beacons fire
 			// only on local dev servers; everywhere else the path is a no-op.
@@ -229,6 +236,11 @@
 				dataUrl: "Build/WebGL.data",
 				frameworkUrl: "Build/WebGL.framework.js",
 				codeUrl: "Build/WebGL.wasm",
+				// WebPort #23: Debug Symbols is ON for this build. The loader fetches
+				// this LAZILY (only when a stack trace needs mapping) and falls back
+				// to unmapped frames if missing, so a build without symbols.json is
+				// still fine with this line present.
+				symbolsUrl: "Build/WebGL.symbols.json",
 				streamingAssetsUrl: "StreamingAssets",
 				companyName: "Fishagon",
 				productName: "Stick It To The Stickman",
